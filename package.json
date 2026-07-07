@@ -1,0 +1,20 @@
+{
+  "name": "swapx",
+  "version": "1.0.0",
+  "description": "SwapX DEX — Monorepo Root",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently --names \"BACKEND,FRONTEND\" --prefix-colors \"cyan,magenta\" \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
+    "dev:backend": "npm run dev --prefix backend",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "install:all": "npm install --prefix backend && npm install --prefix frontend && npm install --prefix contracts",
+    "deploy:sepolia": "npm run deploy:sepolia --prefix contracts",
+    "deploy:local": "npm run deploy:local --prefix contracts",
+    "compile": "npm run compile --prefix contracts",
+    "build": "npm run build --prefix frontend",
+    "lint": "npm run lint --prefix frontend && npm run lint --prefix backend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

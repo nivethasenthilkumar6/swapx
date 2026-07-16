@@ -76,14 +76,37 @@ const PoolCard: React.FC = () => {
   };
 
   const approveToken = async (tokenAddress: string, tokenSymbol: string, amountUnits: bigint, signer: any) => {
-    const tokenContract = new Contract(tokenAddress, ERC20_ABI, signer);
+    const tokenContract = new Contract(tokenAddress, [
+      ...ERC20_ABI,
+      'function decimals() view returns (uint8)',
+      'function name() view returns (string)',
+    ], signer);
+
     setLiquidityStatus(`Checking ${tokenSymbol} allowance...`);
-    const allowance = await tokenContract.allowance(address, LIQUIDITY_MANAGER_ADDRESS);
-    if (allowance < amountUnits) {
-      setLiquidityStatus(`Approving ${tokenSymbol} spend...`);
-      const approveTx = await tokenContract.approve(LIQUIDITY_MANAGER_ADDRESS, amountUnits);
-      setLiquidityStatus(`Waiting for ${tokenSymbol} approval...`);
-      await approveTx.wait();
+
+    // Verify it's a real ERC20 first
+    try {
+      await tokenContract.name();
+    } catch {
+      throw new Error(`${tokenSymbol} is not a valid ERC20 token on this network.`);
+    }
+
+    const currentAllowance: bigint = await tokenContract.allowance(address, LIQUIDITY_MANAGER_ADDRESS);
+
+    if (currentAllowance < amountUnits) {
+      setLiquidityStatus(`Approving ${tokenSymbol}... (confirm in wallet)`);
+      // Use MaxUint256 so user doesn't need to approve again for future txs
+      const MaxUint256 = BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
+      const approveTx = await tokenContract.approve(LIQUIDITY_MANAGER_ADDRESS, MaxUint256);
+      setLiquidityStatus(`Waiting for ${tokenSymbol} approval confirmation...`);
+      const receipt = await approveTx.wait();
+      if (!receipt || receipt.status === 0) {
+        throw new Error(`Approval transaction for ${tokenSymbol} failed on-chain.`);
+      }
+      // Small pause to let RPC node sync the new allowance
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    } else {
+      setLiquidityStatus(`${tokenSymbol} already approved ✓`);
     }
   };
   
@@ -114,6 +137,84 @@ const PoolCard: React.FC = () => {
     })()
   );
 
+  const [poolData, setPoolData] = useState<{
+    exists: boolean;
+    reserveA: string;
+    reserveB: string;
+    priceA: string;
+    priceB: string;
+    userPoolShare: string;
+    userLPBalance: string;
+  } | null>(null);
+
+  const fetchPoolData = useCallback(async () => {
+    if (!tokenA || !tokenB) {
+      setPoolData(null);
+      return;
+    }
+
+    const provider = await getProvider();
+    if (!provider) return;
+
+    try {
+      const manager = new Contract(LIQUIDITY_MANAGER_ADDRESS, LIQUIDITY_MANAGER_ABI, provider);
+      
+      const tokenAAddress = tokenA.isNative ? normalizePath(['0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE'])[0] : tokenA.address;
+      const tokenBAddress = tokenB.isNative ? normalizePath(['0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE'])[0] : tokenB.address;
+
+      if (tokenAAddress.toLowerCase() === tokenBAddress.toLowerCase()) {
+        setPoolData(null);
+        return;
+      }
+
+      const [pairAddress, exists] = await manager.checkPair(tokenAAddress, tokenBAddress);
+      
+      if (!exists) {
+        setPoolData({ exists: false, reserveA: '0', reserveB: '0', priceA: '0', priceB: '0', userPoolShare: '100', userLPBalance: '0' });
+        return;
+      }
+
+      const [reserveA, reserveB] = await manager.getReserves(tokenAAddress, tokenBAddress);
+      
+      const resA = Number(formatUnits(reserveA, tokenA.decimals));
+      const resB = Number(formatUnits(reserveB, tokenB.decimals));
+      
+      const priceA = resA > 0 ? (resB / resA).toFixed(6) : '0';
+      const priceB = resB > 0 ? (resA / resB).toFixed(6) : '0';
+
+      let userPoolShare = '0';
+      let userLPBalance = '0';
+      if (address) {
+        const [balance, totalSupply] = await manager.getLPBalance(tokenAAddress, tokenBAddress, address);
+        userLPBalance = formatUnits(balance, 18);
+        if (totalSupply > 0n) {
+          userPoolShare = ((Number(balance) / Number(totalSupply)) * 100).toFixed(4);
+        }
+      }
+
+      setPoolData({
+        exists: true,
+        reserveA: resA.toLocaleString(undefined, { maximumFractionDigits: 4 }),
+        reserveB: resB.toLocaleString(undefined, { maximumFractionDigits: 4 }),
+        priceA,
+        priceB,
+        userPoolShare,
+        userLPBalance
+      });
+
+    } catch (error) {
+      console.error('Failed to fetch pool data:', error);
+      setPoolData(null);
+    }
+  }, [tokenA, tokenB, address, connector]);
+
+  useEffect(() => {
+    void fetchPoolData();
+    // Refresh pool data every 10 seconds
+    const interval = setInterval(() => void fetchPoolData(), 10000);
+    return () => clearInterval(interval);
+  }, [fetchPoolData]);
+
   const onAddLiquidity = async () => {
     if (!canAddLiquidity || !tokenA || !tokenB || !address) return;
     setLiquidityError(null);
@@ -129,8 +230,10 @@ const PoolCard: React.FC = () => {
       const manager = new Contract(LIQUIDITY_MANAGER_ADDRESS, LIQUIDITY_MANAGER_ABI, signer);
       const amountAUnits = parseUnits(amountA, tokenA.isNative ? 18 : tokenA.decimals);
       const amountBUnits = parseUnits(amountB, tokenB.isNative ? 18 : tokenB.decimals);
-      const amountAMin = getMinimum(amountAUnits);
-      const amountBMin = getMinimum(amountBUnits);
+      // We set min to 0 to allow arbitrary input ratios. 
+      // The router will find the optimal ratio and LiquidityManager will refund the rest.
+      const amountAMin = 0n;
+      const amountBMin = 0n;
       const deadline = Math.floor(Date.now() / 1000) + 60 * 20;
       let tx: any;
 
@@ -195,6 +298,84 @@ const PoolCard: React.FC = () => {
     }
   };
 
+  // Fetch top available pools when no tokens are selected
+  const [availablePools, setAvailablePools] = useState<{
+    tokenA: Token;
+    tokenB: Token;
+    reserveA: string;
+    reserveB: string;
+    pairAddress: string;
+  }[] | null>(null);
+  const [isLoadingPools, setIsLoadingPools] = useState(false);
+
+  useEffect(() => {
+    if (tokenA || tokenB) return;
+
+    const loadAvailablePools = async () => {
+      setIsLoadingPools(true);
+      try {
+        const provider = await getProvider();
+        if (!provider) return;
+
+        // Fetch tokens from backend
+        const BACKEND_URL = import.meta.env.DEV ? '' : import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+        const res = await fetch(`${BACKEND_URL}/api/tokens`);
+        if (!res.ok) throw new Error('Failed to fetch tokens');
+        const json = await res.json();
+        if (!json.success || !Array.isArray(json.data)) throw new Error('Invalid token data');
+
+        // Take top 6 tokens
+        const topTokens = json.data.slice(0, 6).map((t: any) => ({
+          address: t.address,
+          symbol: t.symbol,
+          name: t.name,
+          decimals: t.decimals,
+          logoURI: t.logoURI,
+          isNative: t.address === '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE',
+        } as Token));
+
+        const manager = new Contract(LIQUIDITY_MANAGER_ADDRESS, LIQUIDITY_MANAGER_ABI, provider);
+        const poolsFound = [];
+
+        // Check combinations
+        for (let i = 0; i < topTokens.length; i++) {
+          for (let j = i + 1; j < topTokens.length; j++) {
+            const tA = topTokens[i];
+            const tB = topTokens[j];
+            const addrA = tA.isNative ? normalizePath(['0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE'])[0] : tA.address;
+            const addrB = tB.isNative ? normalizePath(['0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE'])[0] : tB.address;
+
+            if (addrA.toLowerCase() === addrB.toLowerCase()) continue;
+
+            const [pairAddress, exists] = await manager.checkPair(addrA, addrB);
+            if (exists) {
+              const [resA, resB] = await manager.getReserves(addrA, addrB);
+              const numResA = Number(formatUnits(resA, tA.decimals));
+              const numResB = Number(formatUnits(resB, tB.decimals));
+              
+              if (numResA > 0 && numResB > 0) {
+                poolsFound.push({
+                  tokenA: tA,
+                  tokenB: tB,
+                  reserveA: numResA.toLocaleString(undefined, { maximumFractionDigits: 2 }),
+                  reserveB: numResB.toLocaleString(undefined, { maximumFractionDigits: 2 }),
+                  pairAddress
+                });
+              }
+            }
+          }
+        }
+        setAvailablePools(poolsFound);
+      } catch (error) {
+        console.error('Error loading available pools:', error);
+      } finally {
+        setIsLoadingPools(false);
+      }
+    };
+    
+    void loadAvailablePools();
+  }, [tokenA, tokenB, connector]);
+
   return (
     <div className="w-full max-w-2xl bg-card border border-border shadow-2xl overflow-hidden relative">
       <div className="absolute top-0 right-0 w-64 h-64 bg-primary/10 blur-[120px] rounded-full pointer-events-none" />
@@ -228,28 +409,99 @@ const PoolCard: React.FC = () => {
           />
         </div>
 
+        {/* Available Pools List (when nothing is selected) */}
+        {!tokenA && !tokenB && (
+          <div className="mb-6 border border-border rounded-lg bg-secondary/50 overflow-hidden">
+            <div className="px-4 py-3 border-b border-border bg-secondary font-semibold text-sm">
+              Available Liquidity Pools
+            </div>
+            <div className="p-2 max-h-60 overflow-y-auto">
+              {isLoadingPools ? (
+                <div className="text-center py-6 text-muted-foreground text-sm flex items-center justify-center gap-2">
+                  <div className="w-4 h-4 rounded-full border-2 border-primary border-t-transparent animate-spin" />
+                  Finding active pools...
+                </div>
+              ) : availablePools && availablePools.length > 0 ? (
+                <div className="space-y-2">
+                  {availablePools.map((pool, i) => (
+                    <button
+                      key={i}
+                      onClick={() => {
+                        setTokenA(pool.tokenA);
+                        setTokenB(pool.tokenB);
+                      }}
+                      className="w-full flex items-center justify-between p-3 rounded bg-card hover:bg-secondary border border-border transition-colors text-left"
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className="flex -space-x-2">
+                          <img src={pool.tokenA.logoURI || ''} alt={pool.tokenA.symbol} className="w-6 h-6 rounded-full bg-muted border-2 border-card" onError={(e) => (e.target as any).style.display = 'none'} />
+                          <img src={pool.tokenB.logoURI || ''} alt={pool.tokenB.symbol} className="w-6 h-6 rounded-full bg-muted border-2 border-card" onError={(e) => (e.target as any).style.display = 'none'} />
+                        </div>
+                        <span className="font-semibold">{pool.tokenA.symbol} / {pool.tokenB.symbol}</span>
+                      </div>
+                      <div className="text-xs text-muted-foreground text-right">
+                        <div>{pool.reserveA} {pool.tokenA.symbol}</div>
+                        <div>{pool.reserveB} {pool.tokenB.symbol}</div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-center py-6 text-muted-foreground text-sm">
+                  No active pools found for popular tokens.
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         <div className="mb-6">
           <h3 className="text-sm font-semibold mb-3">Fee Tier</h3>
           <FeeTierSelector selectedFee={feeTier} onSelect={setFeeTier} />
         </div>
 
-        {tokenA && tokenB && (
-          <div className="p-4 border border-border bg-secondary mb-6">
-            <h4 className="text-sm font-semibold mb-2">Initial Prices and Pool Share</h4>
-            <div className="grid grid-cols-3 gap-4 text-center">
-              <div>
-                <div className="text-lg font-bold">0.00</div>
-                <div className="text-xs text-muted-foreground">{tokenA.symbol} per {tokenB.symbol}</div>
+        {tokenA && tokenB && poolData && (
+          <div className="p-4 border border-border bg-secondary mb-6 rounded-lg space-y-4">
+            <h4 className="text-sm font-semibold mb-2 flex items-center justify-between">
+              <span>Pool Information</span>
+              {poolData.exists ? (
+                <span className="text-xs bg-green-500/10 text-green-500 px-2 py-1 rounded-full border border-green-500/20">Pool Exists</span>
+              ) : (
+                <span className="text-xs bg-yellow-500/10 text-yellow-500 px-2 py-1 rounded-full border border-yellow-500/20">New Pool</span>
+              )}
+            </h4>
+            
+            <div className="grid grid-cols-2 gap-4 text-sm bg-card p-3 rounded-md border border-border">
+              <div className="flex justify-between items-center">
+                <span className="text-muted-foreground">Available {tokenA.symbol}:</span>
+                <span className="font-bold">{poolData.reserveA}</span>
               </div>
+              <div className="flex justify-between items-center">
+                <span className="text-muted-foreground">Available {tokenB.symbol}:</span>
+                <span className="font-bold">{poolData.reserveB}</span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-4 text-center py-2">
               <div>
-                <div className="text-lg font-bold">0.00</div>
+                <div className="text-lg font-bold">{poolData.exists ? poolData.priceA : '-'}</div>
                 <div className="text-xs text-muted-foreground">{tokenB.symbol} per {tokenA.symbol}</div>
               </div>
               <div>
-                <div className="text-lg font-bold">0%</div>
-                <div className="text-xs text-muted-foreground">Share of Pool</div>
+                <div className="text-lg font-bold">{poolData.exists ? poolData.priceB : '-'}</div>
+                <div className="text-xs text-muted-foreground">{tokenA.symbol} per {tokenB.symbol}</div>
+              </div>
+              <div>
+                <div className="text-lg font-bold">{poolData.exists ? `${poolData.userPoolShare}%` : '100%'}</div>
+                <div className="text-xs text-muted-foreground">Your Share of Pool</div>
               </div>
             </div>
+            
+            {poolData.exists && Number(poolData.userLPBalance) > 0 && (
+              <div className="mt-2 text-center text-xs text-muted-foreground">
+                You own <strong>{Number(poolData.userLPBalance).toFixed(6)}</strong> LP tokens
+              </div>
+            )}
           </div>
         )}
 
